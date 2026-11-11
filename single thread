@@ -1,0 +1,434 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <curl/curl.h>
+#include <string.h>
+#include <pthread.h>
+#include <math.h>
+
+struct return_message{ //for curl to write the json to
+    size_t size;
+    char *data;
+};
+
+struct file_info{ //store in order needed
+    uint32_t message_amount;
+    char *file_path;
+    uint64_t *message_ids;
+};
+
+struct thread_args{
+    FILE *in_file;
+    char *file_piece;
+    curl_mimepart *part;
+    pthread_mutex_t *mutex;
+    pthread_cond_t *wait_notifier;
+    char *num_string;
+};
+
+size_t BLOCK_SIZE=1024*1024*20;
+
+FILE *filecheck(char *file_path, char *file_access){
+    FILE *test_open=fopen(file_path, file_access);
+
+    if (!test_open){
+        printf("Invalid file path or permissions\n");
+        return NULL;
+    }
+
+    return test_open;
+}
+
+//encrypt/decrypt function
+
+//handles filling the return_message struct with data from the json response from curl 
+size_t curl_response_save(void *incoming_bytes, size_t items, size_t item_num, void *save_location){
+    size_t total_bytes=items*item_num;
+    struct return_message *message=(struct return_message *)save_location;
+
+    char *try_realloc=realloc(message->data, message->size+total_bytes+1); //cjson needs a null terminator
+    if (!try_realloc){
+        return 0;
+    }
+
+    message->data=try_realloc;
+
+    memcpy(&(message->data[message->size]), incoming_bytes, total_bytes);
+
+    message->size+=total_bytes;
+    message->data[message->size]='\0';
+
+    return total_bytes;
+}
+
+//write to index, return int8_t for termination status and is passed a struct file_info *
+
+//read index
+
+void *read_file(void *args_void){//range to read and mutex, maybe pass it curl handle so it can update stuff
+    struct thread_args *args=(struct thread_args *)args_void;
+    size_t read=BLOCK_SIZE;
+    char *swap_ptr=NULL;
+
+    char *reading_piece=malloc(BLOCK_SIZE);
+    if (!reading_piece){
+        fclose(args->in_file);
+        exit(-1);
+    }
+
+    while (read==BLOCK_SIZE){
+        read=fread(reading_piece, 1, BLOCK_SIZE, args->in_file);
+
+        if (read==0){
+            return NULL;
+        }
+
+        usleep(8*1000); //8 millisecond delay to simulate encryption
+
+        pthread_mutex_lock(args->mutex);
+
+        swap_ptr=args->file_piece;
+        args->file_piece=reading_piece;
+        reading_piece=swap_ptr;
+
+        curl_mime_data(args->part, args->file_piece, read);
+        curl_mime_filename(args->part, args->num_string);
+
+        pthread_cond_signal(args->wait_notifier);
+        pthread_mutex_unlock(args->mutex);
+    }
+
+    return NULL;
+}
+
+struct file_info *upload(FILE *in_file, size_t file_size, CURL *handle){
+    if (file_size<BLOCK_SIZE){
+        BLOCK_SIZE=file_size;
+    }
+
+    int piece_amount=(file_size+BLOCK_SIZE-1)/BLOCK_SIZE;
+
+    char num_string[12]="1"; //for converting the index num to string
+
+    char temp_msg_id[20]="0000000000000000000\0";
+
+    char time_check[11]="0000000000\0";
+    char time_check_blank[11]="0000000000\0";
+    uint8_t time_index=0;
+    float sleep_time=0;
+
+    struct file_info *file_index_info=malloc(sizeof(struct file_info));
+    if (!file_index_info){
+        return NULL;
+    }
+    file_index_info->message_amount=1;
+    file_index_info->message_ids=malloc(sizeof(uint64_t));
+
+    char *file_peice=malloc(BLOCK_SIZE);
+    if (!file_peice){
+        return NULL;
+    }
+
+    struct return_message *return_message=malloc(sizeof(struct return_message));
+    if (!return_message){
+        return NULL;
+    }
+    return_message->data=NULL;
+    return_message->size=0;
+
+    char *webhook_base="https://discord.com/api/webhooks/?wait=true";
+    curl_easy_setopt(handle, CURLOPT_URL, webhook_base);
+
+    curl_mime *mime=curl_mime_init(handle);
+    curl_mimepart *part=curl_mime_addpart(mime);
+    curl_easy_setopt(handle, CURLOPT_MIMEPOST, mime);
+
+    curl_mime_name(part, "files[0]");
+    
+
+    curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, curl_response_save);
+    curl_easy_setopt(handle, CURLOPT_WRITEDATA, return_message);
+
+    pthread_t reading_thread;
+    pthread_mutex_t mutex=PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t wait_notifier=PTHREAD_COND_INITIALIZER;
+
+    struct thread_args *args=malloc(sizeof(struct thread_args));
+    args->in_file=in_file;
+    args->file_piece=file_peice;
+    args->part=part;
+    args->mutex=&mutex;
+    args->wait_notifier=&wait_notifier;
+    args->num_string=num_string;
+
+    pthread_mutex_lock(&mutex);
+
+    if (pthread_create(&reading_thread, NULL, read_file, args)!=0){
+        printf("Failed to create thread\n");
+        return NULL;
+    }
+    pthread_detach(reading_thread);
+
+    while (1){
+        pthread_cond_wait(&wait_notifier, &mutex);
+
+        while (1){
+            CURLcode result=curl_easy_perform(handle);
+            uint64_t return_code=0;
+            curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &return_code);
+            return_message->size=0;
+
+            if (return_code==429){
+                printf("rate limited\n");
+                do{
+                    //{"message": "You are being rate limited.", "retry_after": 0.3, "global": false}
+                    time_check[time_index]=return_message->data[58+time_index];
+                    time_index++;
+                } while (time_check[time_index-1]!=',');
+
+                time_check[time_index]=0;
+                time_index=0;
+
+                sleep_time=strtof(time_check, NULL);
+                if (sleep_time==0){
+                    return NULL;
+                }
+                    
+                memcpy(time_check, time_check_blank, sizeof(time_check_blank));
+
+                usleep(sleep_time*1000000);
+
+                continue;
+            }
+            else if (result!=CURLE_OK || return_code!=200){
+                printf("Upload failed");
+                return NULL;
+            }
+
+            break;
+        }
+
+        memcpy(temp_msg_id, return_message->data+78, 19);
+
+        file_index_info->message_ids=realloc(file_index_info->message_ids, sizeof(uint64_t)*file_index_info->message_amount);
+        file_index_info->message_ids[file_index_info->message_amount-1]=strtoull(temp_msg_id, NULL, 10);
+        if (file_index_info->message_ids[file_index_info->message_amount-1]==0){
+            return NULL;
+        }
+
+        file_index_info->message_amount++;
+        snprintf(num_string, sizeof(num_string), "%i", file_index_info->message_amount);
+
+        if (file_index_info->message_amount>piece_amount){
+            break;
+        }
+    }
+
+    curl_mime_free(mime);
+    curl_easy_cleanup(handle);
+    curl_global_cleanup();
+    free(return_message->data);
+    free(return_message);
+    free(file_peice);
+    fclose(in_file);
+    return file_index_info;
+}
+
+int8_t download(FILE *down_file, struct file_info *info){
+    //loop through and append memory block to the down_file
+}
+
+int main(int argc, char **argv){
+    if (argc==1 || (argc==2 && (strcmp(argv[1], "-h")==0 || strcmp(argv[1], "--help")==0))){
+        printf("Usage: file2discord [single option] [file path]\n");
+        printf("\n");
+        printf("Options:\n");
+        printf("Note: options do not stack\n");
+        printf("-h, --help                 print help screen and exit\n");
+        //may and a -c --check for the index file
+        //-l option to --list uploaded files
+        printf("-u, --upload [file path]   path to the file being uploaded\n");
+        printf("-d, --download [file path] path to the file being downloaded\n");
+        printf("-o, --output [file path]   output file path for download\n");
+        return 0;
+    }
+
+    uint8_t up_index=0;
+    uint8_t down_index=0;
+    uint8_t out_index=0;
+
+    for (int i=1; i<argc; i++){
+        if ((strcmp(argv[i], "-u")==0 || strcmp(argv[i], "--upload")==0)){
+            if (down_index!=0){
+                printf("Cannot do multiple operations at once\n");
+                return -1;
+            }
+
+            if (out_index!=0){
+                printf("No output file needed for operation\n");
+                return -1;
+            }
+
+            i+=1;
+            if (i>=argc){
+                printf("Invalid option format\n");
+                return -1;
+            }
+
+            up_index=i;
+        }
+
+        else if ((strcmp(argv[i], "-d")==0 || strcmp(argv[i], "--download")==0)){
+            if (up_index!=0){
+                printf("Cannot do multiple operations at once\n");
+                return -1;
+            }
+
+            i+=1;
+
+            if (i>=argc){
+                printf("Invalid option format\n");
+                return -1;
+            }
+
+            down_index=i;
+        }
+
+        else if ((strcmp(argv[i], "-o")==0 || strcmp(argv[i], "--output")==0)){
+            if (down_index==0){
+                printf("No input file\n");
+                return -1;
+            }
+
+            if (up_index!=0){
+                printf("No output file needed for operation\n");
+                return -1;
+            }
+
+            i+=1;
+
+            if (i>=argc){
+                printf("Invalid option format\n");
+                return -1;
+            }
+
+            out_index=i;
+        }
+
+        else{
+            printf("Invalid option\n");
+            return -1;
+        }
+    }
+
+    //if check
+        //run read index and return
+
+    CURLcode result=curl_global_init(CURL_GLOBAL_SSL);
+    if(result!=CURLE_OK){
+        return -1;
+    }
+
+    CURL *handle=curl_easy_init();
+    if (!handle){
+        printf("curl initialization failed\n");
+        curl_global_cleanup();
+        return -1;
+    }
+
+    if (out_index==0){
+        out_index=down_index;
+    }
+
+    FILE *working_file=NULL;
+    struct stat file_info;
+
+    if (up_index!=0){
+        stat(argv[up_index], &file_info);
+
+        working_file=filecheck(argv[up_index], "rb");
+    }
+    else{
+        working_file=filecheck(argv[out_index], "wb");
+    }
+
+    if (!working_file){
+        return -1;
+    }
+
+    if (up_index!=0){
+        struct file_info *messages=upload(working_file, file_info.st_size, handle);
+        if (!messages){
+            return -1;
+        }
+
+        messages->file_path=argv[up_index];
+
+        //return write to index
+    }
+    //read index
+    //return download
+}
+
+
+/*
+    gcc -g -O1 file2discord-threaded.c -o file2discord-threaded -lcurl -pthread
+    
+    sudo perf stat ./file2discord-threaded -u random-data-test-file-small
+
+    Performance counter stats for './file2discord-threaded -u random-data-test-file-small':
+
+            37,279      context-switches                 #   6817.2 cs/sec  cs_per_second     
+             2,372      cpu-migrations                   #    433.8 migrations/sec  migrations_per_second
+             2,079      page-faults                      #    380.2 faults/sec  page_faults_per_second
+          5,468.38 msec task-clock                       #      0.0 CPUs  CPUs_utilized       
+        93,484,976      branch-misses                    #     12.3 %  branch_miss_rate         (51.35%)
+       769,403,788      branches                         #    140.7 M/sec  branch_frequency     (68.40%)
+    11,869,943,911      cpu-cycles                       #      2.2 GHz  cycles_frequency       (66.23%)
+     5,234,037,621      instructions                     #      0.4 instructions  insn_per_cycle  (64.94%)
+     4,190,736,364      stalled-cycles-frontend          #     0.35 frontend_cycles_idle        (66.79%)
+
+     188.174369254 seconds time elapsed
+
+       2.097204000 seconds user
+       3.400979000 seconds sys
+
+
+    Performance counter stats for './file2discord-threaded -u random-data-test-file-small':
+
+            33,940      context-switches                 #   5224.5 cs/sec  cs_per_second     
+             1,283      cpu-migrations                   #    197.5 migrations/sec  migrations_per_second
+             2,612      page-faults                      #    402.1 faults/sec  page_faults_per_second
+          6,496.29 msec task-clock                       #      0.0 CPUs  CPUs_utilized       
+        92,747,304      branch-misses                    #     13.1 %  branch_miss_rate         (51.53%)
+       709,502,713      branches                         #    109.2 M/sec  branch_frequency     (67.50%)
+    12,052,896,786      cpu-cycles                       #      1.9 GHz  cycles_frequency       (67.57%)
+     4,917,386,860      instructions                     #      0.4 instructions  insn_per_cycle  (65.28%)
+     4,894,643,501      stalled-cycles-frontend          #     0.41 frontend_cycles_idle        (64.79%)
+
+     191.262706429 seconds time elapsed
+
+       2.825997000 seconds user
+       3.844338000 seconds sys
+
+
+    Performance counter stats for './file2discord-threaded -u random-data-test-file-small':
+
+            34,288      context-switches                 #   4619.7 cs/sec  cs_per_second     
+             1,350      cpu-migrations                   #    181.9 migrations/sec  migrations_per_second
+             2,587      page-faults                      #    348.6 faults/sec  page_faults_per_second
+          7,422.14 msec task-clock                       #      0.0 CPUs  CPUs_utilized       
+        94,831,366      branch-misses                    #     13.6 %  branch_miss_rate         (49.83%)
+       707,052,914      branches                         #     95.3 M/sec  branch_frequency     (66.73%)
+    12,940,899,020      cpu-cycles                       #      1.7 GHz  cycles_frequency       (67.28%)
+     4,885,292,063      instructions                     #      0.4 instructions  insn_per_cycle  (66.71%)
+     5,805,119,346      stalled-cycles-frontend          #     0.45 frontend_cycles_idle        (66.91%)
+
+     202.953972163 seconds time elapsed
+
+       3.289492000 seconds user
+       4.376273000 seconds sys
+   
+*/
